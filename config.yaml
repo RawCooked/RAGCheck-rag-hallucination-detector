@@ -1,0 +1,49 @@
+# RAGCheck configuration
+# Central place for model names, paths, and pipeline parameters so nothing
+# is hardcoded inside the source files. Override any of these with
+# environment variables (see .env.example) where noted.
+
+corpus:
+  # HuggingFace dataset used to seed the demo RAG pipeline (Step 1 only).
+  # rag-mini-wikipedia ships a small pre-chunked Wikipedia passage corpus
+  # (~3.2k passages) plus a matching QA set, which is exactly what a demo
+  # retriever needs and is small enough to embed on a laptop CPU.
+  # It is NOT the benchmark dataset -- RAGTruth / HaluEval (loaded later,
+  # in src/benchmark/) already ship their own (question, context, answer)
+  # triples with hallucination labels, so they don't need our retriever.
+  dataset_name: "rag-datasets/rag-mini-wikipedia"
+  text_config: "text-corpus"
+  qa_config: "question-answer"
+
+chunking:
+  # rag-mini-wikipedia passages are already short, but we still pass them
+  # through the chunker so the pipeline works on arbitrary raw text later.
+  chunk_size_words: 150
+  chunk_overlap_words: 30
+
+embedding:
+  # Small, fast, CPU-friendly sentence embedding model with strong
+  # retrieval performance for its size -- a standard default choice.
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+
+vectorstore:
+  provider: "chromadb"
+  persist_dir: "data/chroma_db"
+  collection_name: "ragcheck_corpus"
+
+retrieval:
+  top_k: 3
+
+generation:
+  # "local" runs a small instruction-tuned seq2seq model on-device, no API
+  # key required. Swap to "openai" later once verification/ needs a
+  # stronger generator -- the interface in src/rag/generator.py is written
+  # so callers don't care which backend is behind it.
+  backend: "local"
+  local_model_name: "google/flan-t5-base"
+  max_new_tokens: 200
+  openai_model_name: "gpt-4o-mini"
+
+paths:
+  data_dir: "data"
+  raw_corpus_cache: "data/corpus_cache"
