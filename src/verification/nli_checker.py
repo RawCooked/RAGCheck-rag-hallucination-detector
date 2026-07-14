@@ -1,30 +1,56 @@
-"""STUB -- not implemented yet. This is the core of the project.
+"""The core of the project: decides whether a claim is actually supported
+by the retrieved evidence, using Natural Language Inference (NLI) rather
+than surface-level similarity. NLI catches cases embedding similarity
+misses -- e.g. "Lincoln was the seventeenth President" sits right next to
+"Lincoln was the sixteenth President" in embedding space (same entities,
+same topic), so a similarity-only check would call it supported. An NLI
+model reads the two sentences as a (premise, hypothesis) pair and asks
+"does the premise logically entail the hypothesis?" -- and correctly says
+no, because sixteenth != seventeenth.
 
-Purpose: given one claim and the retrieved evidence chunks it should be
-grounded in, decide whether the evidence *entails* the claim, *contradicts*
-it, or is *neutral* (unrelated/insufficient) -- using a Natural Language
-Inference (NLI) model rather than surface-level word/embedding overlap.
-NLI catches cases embedding similarity misses, e.g. a claim that mentions
-all the right entities but gets a number or relationship backwards.
+Model: cross-encoder/nli-deberta-v3-base, a DeBERTa-v3 model fine-tuned
+directly for 3-way NLI classification (entailment / neutral /
+contradiction) on MNLI+SNLI+FEVER. Loaded via sentence-transformers'
+CrossEncoder, which scores a (premise, hypothesis) pair in one forward
+pass -- unlike the bi-encoder used for retrieval, which embeds each text
+separately and can only compare embeddings after the fact.
 
-Planned approach (not yet decided/implemented):
-  - Load a pretrained NLI model (candidates: "roberta-large-mnli",
-    or a DeBERTa-v3 model fine-tuned on MNLI/FEVER -- these are the
-    standard choices for entailment classification).
-  - For each claim, run NLI with (premise=evidence_chunk, hypothesis=claim)
-    for every retrieved chunk, and treat the claim as "supported" if at
-    least one chunk entails it, "hallucinated" if none do (or the top
-    scores are contradiction/neutral).
-  - Needs a documented threshold/aggregation rule across multiple chunks
-    (e.g. max entailment score across chunks vs. requiring one full
-    entailment) -- to be decided once real examples are in front of us.
+Known limitations (both verified empirically):
 
-Will be compared against verification/embedding_checker.py (the simpler
-baseline) in src/benchmark/, on RAGTruth / HaluEval examples.
+1. Off-topic pairs read as contradiction, not neutral. This model was
+   trained on premise/hypothesis pairs that are topically related. Given
+   a genuinely unrelated pair (e.g. a premise about Uruguay's population
+   and a hypothesis about the Eiffel Tower), it confidently predicts
+   "contradiction" instead of "neutral" -- MNLI's "neutral" label means
+   "related but not fully entailed," not "unrelated." This is a real risk
+   here, but a bounded one: evidence_chunks are always chunks retrieved
+   for the *question* the claim's answer was generated from, so premise
+   and hypothesis are rarely topically unrelated in practice.
+
+2. Multi-sentence premises collapse the entailment signal. Cross-encoder
+   NLI models are trained on single-sentence (premise, hypothesis) pairs
+   (SNLI/MNLI/FEVER). Fed a whole ~150-word retrieved chunk as the
+   premise, a claim that is a verbatim sentence from that chunk scored
+   98.7% entailment against just that one sentence, but only 0.3%
+   (99.7% "neutral") against the full chunk containing it -- the signal
+   gets diluted by the surrounding, differently-focused sentences. Fixed
+   below by decomposing each evidence chunk into individual sentences
+   (via src/claims/extractor.py's split_into_sentences(), shared so both
+   call sites behave consistently) and scoring the claim against every
+   sentence from every chunk, not each chunk as one block. This matches
+   the approach used in factual-consistency-checking research (e.g.
+   SummaC, Laban et al. 2022) for exactly this reason.
 """
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
+
+import numpy as np
+from sentence_transformers import CrossEncoder
+
+from src.claims.extractor import split_into_sentences
+from src.config import get_config
 
 
 class EntailmentLabel(Enum):
@@ -41,16 +67,99 @@ class VerificationResult:
     supporting_chunk_id: str | None
 
 
+@lru_cache(maxsize=1)
+def _get_nli_model() -> CrossEncoder:
+    cfg = get_config()["verification"]
+    return CrossEncoder(cfg["nli_model_name"])
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    exp = np.exp(logits - np.max(logits))
+    return exp / exp.sum()
+
+
 def check_claim_entailment(claim_text: str, evidence_chunks: list[dict]) -> VerificationResult:
     """Checks whether `claim_text` is entailed by any of `evidence_chunks`.
+
+    Each chunk is first split into individual sentences (see limitation 2
+    in this module's docstring for why), and the claim is scored against
+    every sentence from every chunk -- not just the top retrieval hit,
+    since the passage that best matches the *question* isn't always the
+    one whose specific sentence best supports a given *claim*.
+
+    A claim is judged ENTAILMENT if any evidence sentence's entailment
+    probability clears entailment_threshold. Failing that, it's
+    CONTRADICTION if some sentence's contradiction probability clears
+    contradiction_threshold. Otherwise NEUTRAL: no retrieved evidence
+    speaks to this claim either way, which -- for a hallucination
+    detector -- is just as much a red flag as an outright contradiction.
 
     Args:
         claim_text: a single atomic claim (see src/claims/extractor.py).
         evidence_chunks: retrieved chunks, as returned by
-            src/rag/retriever.py's retrieve() (each with a "text" key).
+            src/rag/retriever.py's retrieve() (each with "text" and
+            "chunk_id" keys).
 
     Returns:
         A VerificationResult describing the strongest entailment relation
-        found across all evidence chunks.
+        found across all evidence sentences. supporting_chunk_id
+        identifies which *chunk* the winning sentence came from.
     """
-    raise NotImplementedError("NLI-based verification is not implemented yet (Step 1 is scaffolding only).")
+    if not evidence_chunks:
+        return VerificationResult(
+            claim_text=claim_text, label=EntailmentLabel.NEUTRAL, confidence=1.0, supporting_chunk_id=None
+        )
+
+    # Flatten chunks into (sentence, originating chunk_id) pairs so the
+    # NLI model always sees a single-sentence premise, while we can still
+    # report which chunk backs the verdict.
+    sentence_chunk_ids: list[str] = []
+    sentences: list[str] = []
+    for chunk in evidence_chunks:
+        for sentence in split_into_sentences(chunk["text"]):
+            sentences.append(sentence)
+            sentence_chunk_ids.append(chunk["chunk_id"])
+
+    if not sentences:
+        return VerificationResult(
+            claim_text=claim_text, label=EntailmentLabel.NEUTRAL, confidence=1.0, supporting_chunk_id=None
+        )
+
+    cfg = get_config()["verification"]
+    model = _get_nli_model()
+    label_to_index = {label.lower(): int(idx) for idx, label in model.config.id2label.items()}
+
+    # CrossEncoder scores a (premise, hypothesis) pair per call; premise
+    # is the evidence sentence, hypothesis is the claim being checked.
+    pairs = [(sentence, claim_text) for sentence in sentences]
+    raw_logits = model.predict(pairs)  # shape (n_sentences, 3), NOT yet probabilities
+    probs = np.array([_softmax(row) for row in raw_logits])
+
+    entail_probs = probs[:, label_to_index["entailment"]]
+    contra_probs = probs[:, label_to_index["contradiction"]]
+    neutral_probs = probs[:, label_to_index["neutral"]]
+
+    best_entail_idx = int(np.argmax(entail_probs))
+    if entail_probs[best_entail_idx] >= cfg["entailment_threshold"]:
+        return VerificationResult(
+            claim_text=claim_text,
+            label=EntailmentLabel.ENTAILMENT,
+            confidence=float(entail_probs[best_entail_idx]),
+            supporting_chunk_id=sentence_chunk_ids[best_entail_idx],
+        )
+
+    best_contra_idx = int(np.argmax(contra_probs))
+    if contra_probs[best_contra_idx] >= cfg["contradiction_threshold"]:
+        return VerificationResult(
+            claim_text=claim_text,
+            label=EntailmentLabel.CONTRADICTION,
+            confidence=float(contra_probs[best_contra_idx]),
+            supporting_chunk_id=sentence_chunk_ids[best_contra_idx],
+        )
+
+    return VerificationResult(
+        claim_text=claim_text,
+        label=EntailmentLabel.NEUTRAL,
+        confidence=float(np.max(neutral_probs)),
+        supporting_chunk_id=None,
+    )

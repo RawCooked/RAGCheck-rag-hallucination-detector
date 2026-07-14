@@ -44,6 +44,32 @@ generation:
   max_new_tokens: 200
   openai_model_name: "gpt-4o-mini"
 
+verification:
+  # NLI cross-encoder: scores a (premise, hypothesis) pair directly as
+  # entailment/neutral/contradiction probabilities, rather than needing a
+  # separate classification head -- the standard choice for this task.
+  # ~184M params, runs on CPU in well under a second per claim.
+  nli_model_name: "cross-encoder/nli-deberta-v3-base"
+  # A claim is "supported" if any evidence chunk's entailment probability
+  # clears this bar; "contradicted" if none entail but one's contradiction
+  # probability clears contradiction_threshold; otherwise "neutral"
+  # (no evidence either way). 0.5 is the natural default for a 3-way
+  # softmax: a class only exceeds it if it's already the argmax.
+  entailment_threshold: 0.5
+  contradiction_threshold: 0.5
+  # Embedding-similarity baseline: a claim is "supported" if its cosine
+  # similarity to the closest evidence chunk clears this bar. Reuses the
+  # same embedding model as retrieval (src/rag/embedding.py).
+  embedding_similarity_threshold: 0.5
+
+benchmark:
+  # Row limit for src/benchmark/run_benchmark.py's default run, i.e. how
+  # many HaluEval source rows to score (each yields 2 BenchmarkExamples:
+  # one supported, one hallucinated). Kept small by default so a full
+  # benchmark run finishes in a couple minutes on CPU; override with
+  # --limit on the CLI for a larger/full run.
+  sample_limit: 50
+
 paths:
   data_dir: "data"
   raw_corpus_cache: "data/corpus_cache"

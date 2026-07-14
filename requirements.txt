@@ -12,6 +12,7 @@ pandas>=2.2.0
 
 # --- Metrics / baseline ---
 scikit-learn>=1.4.0
+numpy>=1.26.0
 
 # --- Config / utils ---
 pyyaml>=6.0

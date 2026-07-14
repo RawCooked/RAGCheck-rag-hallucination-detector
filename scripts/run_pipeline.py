@@ -8,9 +8,10 @@ The first run downloads the corpus, the embedding model, and the local
 generation model, then builds the Chroma index -- this takes a minute or
 two. Subsequent runs reuse the persisted index (data/chroma_db/).
 
-Note: this script produces the (question, retrieved_docs, generated_answer)
-triple that the hallucination detector (claims/ + verification/) will
-eventually check -- it does not do any hallucination checking itself yet.
+This is the full pipeline: retrieve -> generate -> extract claims ->
+verify each claim with both the NLI checker and the embedding-similarity
+baseline, so you can see where the two disagree on real (not benchmark)
+questions.
 """
 
 import sys
@@ -26,6 +27,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.rag.pipeline import ensure_index_built, answer_question
+from src.claims.extractor import extract_claims
+from src.verification.nli_checker import check_claim_entailment, EntailmentLabel
+from src.verification.embedding_checker import check_claim_similarity
 
 DEFAULT_QUESTION = "Was Abraham Lincoln the sixteenth President of the United States?"
 
@@ -46,6 +50,26 @@ def main() -> None:
         print(f"      {preview}...")
 
     print(f"\nGENERATED ANSWER:\n  {result.answer}")
+
+    claims = extract_claims(result.answer)
+    print(f"\nCLAIM VERIFICATION ({len(claims)} claim(s)):")
+    for i, claim in enumerate(claims, start=1):
+        nli_result = check_claim_entailment(claim.text, result.retrieved_chunks)
+        emb_result = check_claim_similarity(claim.text, result.retrieved_chunks)
+
+        nli_flag = "OK" if nli_result.label == EntailmentLabel.ENTAILMENT else "HALLUCINATION?"
+        emb_flag = "OK" if emb_result.is_supported else "HALLUCINATION?"
+        agree = "agree" if (nli_flag == "OK") == (emb_flag == "OK") else "DISAGREE"
+
+        print(f"  [{i}] {claim.text}")
+        print(
+            f"      NLI:       {nli_result.label.value:<13} (confidence={nli_result.confidence:.3f}) -> {nli_flag}"
+        )
+        print(
+            f"      Embedding: similarity={emb_result.max_similarity:.3f}                 -> {emb_flag}"
+        )
+        print(f"      [{agree}]")
+
     print("=" * 70 + "\n")
 
 
